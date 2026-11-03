@@ -286,6 +286,43 @@ def test_vec_norm(test, device):
         )
 
 
+@wp.kernel(enable_backward=False)
+def vec_norm_generic_kernel(vs: wp.array[Any], out: wp.array2d[Any], normalized: wp.array[Any]):
+    tid = wp.tid()
+    out[tid, 0] = wp.norm_l1(vs[tid])
+    out[tid, 1] = wp.norm_l2(vs[tid])
+    out[tid, 2] = wp.norm_huber(vs[tid])
+    out[tid, 3] = wp.norm_huber(vs[tid], 0.5)
+    out[tid, 4] = wp.norm_pseudo_huber(vs[tid], 2.0)
+    normalized[tid] = wp.smooth_normalize(vs[tid])
+
+
+def test_vec_norm_dtypes(test, device):
+    """Verify the vector norm helpers accept vectors of every floating-point dtype."""
+    xs_np = np.array([[-2.0, 1.0, 3.0], [0.1, -0.1, 0.1]])
+    lengths = np.linalg.norm(xs_np, axis=1)
+    expected = np.stack(
+        [
+            np.linalg.norm(xs_np, ord=1, axis=1),
+            lengths,
+            np.where(lengths <= 1.0, 0.5 * lengths**2, lengths - 0.5),
+            np.where(lengths <= 0.5, 0.5 * lengths**2, 0.5 * (lengths - 0.25)),
+            2.0 * np.sqrt(1.0 + (lengths / 2.0) ** 2),
+        ],
+        axis=1,
+    )
+    expected_normalized = xs_np / np.sqrt(1.0 + lengths**2)[:, None]
+
+    for vec_type, tol in ((wp.vec3h, 1e-2), (wp.vec3f, 1e-6), (wp.vec3d, 1e-12)):
+        with test.subTest(dtype=vec_type._wp_scalar_type_.__name__):
+            xs = wp.array(xs_np, dtype=vec_type, device=device)
+            out = wp.empty((len(xs_np), 5), dtype=vec_type._wp_scalar_type_, device=device)
+            normalized = wp.empty_like(xs)
+            wp.launch(vec_norm_generic_kernel, dim=len(xs_np), inputs=[xs], outputs=[out, normalized], device=device)
+            np.testing.assert_allclose(out.numpy().astype(np.float64), expected, rtol=tol, atol=tol)
+            np.testing.assert_allclose(normalized.numpy().astype(np.float64), expected_normalized, rtol=tol, atol=tol)
+
+
 @wp.kernel
 def smooth_normalize_kernel(out: wp.array[float]):
     zero = wp.vec3(0.0, 0.0, 0.0)
@@ -625,6 +662,7 @@ add_function_test(TestMath, "test_erfcinv_extreme_args", test_erfcinv_extreme_ar
 add_function_test(TestMath, "test_erfcinv_erfc_roundtrip", test_erfcinv_erfc_roundtrip, devices=devices)
 add_function_test(TestMath, "test_erfinv_extreme_args", test_erfinv_extreme_args, devices=devices)
 add_function_test(TestMath, "test_vec_norm", test_vec_norm, devices=devices)
+add_function_test(TestMath, "test_vec_norm_dtypes", test_vec_norm_dtypes, devices=devices)
 add_function_test(TestMath, "test_smooth_normalize", test_smooth_normalize, devices=devices)
 add_function_test(TestMath, "test_quat_helpers", quat_helpers, devices=devices)
 add_function_test(TestMath, "test_quat_twist_angles", test_quat_twist_angles, devices=devices)
