@@ -126,6 +126,29 @@ def test_transform_slicing_assign_backward(test, device):
     assert_np_equal(x.grad.numpy(), np.array(((1.0, 1.0),), dtype=float))
 
 
+@wp.kernel
+def transform_component_augassign_kernel(x: wp.array[float], out: wp.array[float]):
+    t = wp.transform_identity()
+    t.p += wp.vec3(x[0], x[0], x[0])
+    t.p += wp.vec3(x[0], x[0], x[0])
+    t.q -= wp.quat(x[1], x[1], x[1], x[1])
+    t.q -= wp.quat(x[1], x[1], x[1], x[1])
+    out[0] = t.p.y + t.q.z
+
+
+def test_transform_component_augassign(test, device):
+    """``t.p`` and ``t.q`` updates are not double counted in the backward pass."""
+    x = wp.array([1.0, 2.0], dtype=float, requires_grad=True, device=device)
+    out = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch(transform_component_augassign_kernel, dim=1, inputs=[x, out], device=device)
+    tape.backward(grads={out: wp.ones(1, dtype=float, device=device)})
+
+    assert_np_equal(x.grad.numpy(), np.array([2.0, -2.0]))
+
+
 devices = get_test_devices()
 
 
@@ -135,6 +158,9 @@ class TestSpatialAssignCopy(unittest.TestCase):
 
 add_function_test(TestSpatialAssignCopy, "test_transform_assign", test_transform_assign, devices=devices)
 add_function_test(TestSpatialAssignCopy, "test_transform_assign_copy", test_transform_assign_copy, devices=devices)
+add_function_test(
+    TestSpatialAssignCopy, "test_transform_component_augassign", test_transform_component_augassign, devices=devices
+)
 add_function_test(
     TestSpatialAssignCopy,
     "test_transform_slicing_assign_backward",

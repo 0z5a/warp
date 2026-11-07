@@ -6401,8 +6401,8 @@ class Adjoint:
         Name targets rebind a local or reference parameter directly. Attribute
         and subscript targets first evaluate their complete location, then
         evaluate the right-hand side once. Those compound targets honor user
-        operator overloads before selecting an atomic array-slot update or the
-        general load-operator-store path.
+        operator overloads before selecting an atomic array-slot update, an
+        in-place component update, or the general load-operator-store path.
 
         Args:
             node: Augmented-assignment syntax tree node to lower.
@@ -6565,6 +6565,52 @@ class Adjoint:
             if not adj.store_array_slot(slot, result):
                 adj._store_subscript(lhs, target, indices, result)
 
+        def lower_component_inplace(aggregate: Var, current: Var, ref_calls: int) -> bool:
+            """Apply ``+=`` or ``-=`` to a component of a local vector, quaternion, or transform in place.
+
+            Load-operator-store reads the component and then overwrites it, but the
+            overwrite does not clear the component's adjoint, so the backward pass counts
+            the previous value twice per update. The ``*_inplace`` builtins have no such
+            read. Returns ``False`` if the general path must handle the update.
+
+            Args:
+                aggregate: Resolved aggregate that holds the component.
+                current: Value of the component, loaded before the right-hand side.
+                ref_calls: Length of ``adj.unvalidated_ref_calls`` before the right-hand side.
+            """
+            if not isinstance(node.op, (ast.Add, ast.Sub)) or is_reference(aggregate.type):
+                return False
+
+            aggregate_type = aggregate.type
+            is_transform = type_is_transformation(aggregate_type)
+            is_vector_like = type_is_vector(aggregate_type) or type_is_quaternion(aggregate_type)
+            # Copy-on-write lowering already gives vector and quaternion components a correct adjoint.
+            if is_vector_like and adj.builder_options.get("enable_vector_component_overwrites", False):
+                return False
+            if not (is_transform or is_vector_like):
+                return False
+
+            rhs = eval_rhs()
+            # A wp.ref[T] call may write to the target, so the loaded value must stay in use.
+            if len(adj.unvalidated_ref_calls) != ref_calls:
+                return False
+            # Let the general path report mismatched operands.
+            if not types_equal(strip_reference(rhs.type), strip_reference(current.type)):
+                return False
+
+            suffix = "add_inplace" if isinstance(node.op, ast.Add) else "sub_inplace"
+            if is_vector_like:
+                index = adj.vector_component_index(lhs.attr, aggregate_type)
+                adj.add_builtin_call(suffix, [aggregate, index, rhs])
+            elif lhs.attr == "p":
+                adj.add_builtin_call(f"transform_{suffix}", [aggregate, rhs])
+            else:
+                # Quaternion components are stored after the translation.
+                for i in range(4):
+                    component = adj.add_builtin_call("extract", [rhs, adj.add_constant(i)])
+                    adj.add_builtin_call(suffix, [aggregate, adj.add_constant(3 + i), component])
+            return True
+
         def lower_attribute_augassign() -> None:
             """Load current value of attribute target, apply op, store back."""
             aggregate = adj.resolve_attribute_store_aggregate(lhs.value)
@@ -6572,11 +6618,15 @@ class Adjoint:
             if find_user_operator() is None and adj.atomic_array_slot(slot, eval_rhs, node.op):
                 return
 
+            ref_calls = len(adj.unvalidated_ref_calls)
             with adj.suppress_read_tracking():
                 current = adj.emit_Attribute(lhs, aggregate=aggregate)
 
-            if resolve_user_operator(current) is None and adj.atomic_array_slot(slot, eval_rhs, node.op):
-                return
+            if resolve_user_operator(current) is None:
+                if adj.atomic_array_slot(slot, eval_rhs, node.op):
+                    return
+                if slot is None and lower_component_inplace(aggregate, current, ref_calls):
+                    return
             result = apply_operator(current)
             record_unsupported_slot_adjoint(result, aggregate)
             if not adj.store_array_slot(slot, result):

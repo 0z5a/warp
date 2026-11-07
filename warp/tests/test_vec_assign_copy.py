@@ -136,6 +136,27 @@ def test_bool_vec_assign_copy(test, device):
     wp.synchronize_device(device)
 
 
+@wp.kernel
+def vec_component_iadd_after_read_kernel(x: wp.array[float], out: wp.array[float]):
+    w = wp.vec3(x[0], x[1], x[2])
+    c = wp.dot(w, w)
+    w.y += x[3]
+    out[0] = c + w.y
+
+
+def test_vec_component_iadd_after_read(test, device):
+    """Copy-on-write keeps the value read before ``v.y += x`` intact for the backward pass."""
+    x = wp.array([1.0, 2.0, 3.0, 0.5], dtype=float, requires_grad=True, device=device)
+    out = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch(vec_component_iadd_after_read_kernel, dim=1, inputs=[x, out], device=device)
+    tape.backward(grads={out: wp.ones(1, dtype=float, device=device)})
+
+    assert_np_equal(x.grad.numpy(), np.array([2.0, 5.0, 6.0, 1.0]))
+
+
 devices = get_test_devices()
 
 
@@ -145,6 +166,9 @@ class TestVecAssignCopy(unittest.TestCase):
 
 add_function_test(TestVecAssignCopy, "test_vec_assign", test_vec_assign, devices=devices)
 add_function_test(TestVecAssignCopy, "test_vec_assign_copy", test_vec_assign_copy, devices=devices)
+add_function_test(
+    TestVecAssignCopy, "test_vec_component_iadd_after_read", test_vec_component_iadd_after_read, devices=devices
+)
 add_function_test(TestVecAssignCopy, "test_bool_vec_assign_copy", test_bool_vec_assign_copy, devices=devices)
 add_function_test(
     TestVecAssignCopy, "test_vec_slicing_assign_backward", test_vec_slicing_assign_backward, devices=devices

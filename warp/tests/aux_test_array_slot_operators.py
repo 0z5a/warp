@@ -38,6 +38,23 @@ def overloaded_slot_sub_backward(values: wp.array[wp.vec3], rhs: wp.array[wp.flo
     values[0][1] -= rhs[0]
 
 
+@wp.kernel(module="unique")
+def overloaded_local_component(rhs: wp.array[wp.float32], out: wp.array[wp.float32]):
+    w = wp.vec3(1.0, 2.0, 3.0)
+    w.x += rhs[0]
+    out[0] = w.x
+
+
+@wp.kernel(module="unique")
+def local_double_component_with_float_overloads(
+    values: wp.array[wp.vec3d], rhs: wp.array[wp.float64], out: wp.array[wp.float64]
+):
+    w = values[0]
+    w.x += rhs[0]
+    w.x += rhs[0]
+    out[0] = w.x
+
+
 @wp.func
 def update_overloaded_component(values: wp.array[wp.vec3], rhs: wp.array[float]):
     values[0].x += rhs[0]

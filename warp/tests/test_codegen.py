@@ -1759,6 +1759,25 @@ def test_slot_updates_ignore_nonmatching_operator_overloads(test, device):
     np.testing.assert_array_equal(rhs.grad.numpy(), [1.0])
 
 
+def test_local_component_update_operator_overloads(test, device):
+    """Local component updates honor matching user operators and otherwise use builtin in-place updates."""
+    rhs = wp.array([0.5], dtype=wp.float32, device=device)
+    out = wp.zeros(1, dtype=wp.float32, device=device)
+    wp.launch(slot_operators.overloaded_local_component, dim=1, inputs=[rhs, out], device=device)
+    np.testing.assert_array_equal(out.numpy(), [0.5])
+
+    values = wp.array([wp.vec3d(1.0, 2.0, 3.0)], dtype=wp.vec3d, device=device, requires_grad=True)
+    rhs = wp.array([0.5], dtype=wp.float64, device=device, requires_grad=True)
+    out = wp.zeros(1, dtype=wp.float64, device=device, requires_grad=True)
+    with wp.Tape() as tape:
+        wp.launch(slot_operators.local_double_component_with_float_overloads, 1, [values, rhs, out], device=device)
+    tape.backward(grads={out: wp.ones(1, dtype=wp.float64, device=device)})
+
+    np.testing.assert_array_equal(out.numpy(), [2.0])
+    np.testing.assert_array_equal(values.grad.numpy(), [[1.0, 0.0, 0.0]])
+    np.testing.assert_array_equal(rhs.grad.numpy(), [2.0])
+
+
 @wp.func
 def func_to_local_double(a: float):
     return a * 2.0
@@ -3137,6 +3156,12 @@ add_function_test(
     TestCodeGen,
     "test_slot_updates_ignore_nonmatching_operator_overloads",
     test_slot_updates_ignore_nonmatching_operator_overloads,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_local_component_update_operator_overloads",
+    test_local_component_update_operator_overloads,
     devices=devices,
 )
 add_function_test(TestCodeGen, "test_assign_function_to_local", test_assign_function_to_local, devices=devices)

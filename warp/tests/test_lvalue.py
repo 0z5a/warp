@@ -379,6 +379,173 @@ def test_slice(test, device):
     test.assertEqual(y, expected)
 
 
+@wp.kernel
+def vec_component_iadd_kernel(a: wp.array[wp.vec3], b: wp.array[float], out: wp.array[float]):
+    w = a[0]
+    w.y += b[0]
+    w.y += b[0]
+    w.y += b[0]
+    out[0] = w.y
+
+
+@wp.kernel
+def vec_subscript_iadd_kernel(a: wp.array[wp.vec3], b: wp.array[float], out: wp.array[float]):
+    w = a[0]
+    w[1] += b[0]
+    w[1] += b[0]
+    w[1] += b[0]
+    out[0] = w[1]
+
+
+def test_vec_component_iadd_matches_subscript(test, device):
+    """``v.y += x`` and ``v[1] += x`` have the same gradient."""
+    for kernel in (vec_component_iadd_kernel, vec_subscript_iadd_kernel):
+        a = wp.array([[1.0, 2.0, 3.0]], dtype=wp.vec3, requires_grad=True, device=device)
+        b = wp.array([0.5], dtype=float, requires_grad=True, device=device)
+        out = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+
+        tape = wp.Tape()
+        with tape:
+            wp.launch(kernel, dim=1, inputs=[a, b, out], device=device)
+        tape.backward(grads={out: wp.ones(1, dtype=float, device=device)})
+
+        assert_np_equal(out.numpy(), np.array([3.5]))
+        assert_np_equal(a.grad.numpy(), np.array([[0.0, 1.0, 0.0]]))
+        assert_np_equal(b.grad.numpy(), np.array([3.0]))
+
+
+@wp.kernel
+def vec_component_mixed_kernel(x: wp.array[float], out: wp.array[float]):
+    w = wp.vec3(x[0], x[1], x[2])
+    w.x += x[3]
+    w.y -= x[4]
+    w.z += x[5]
+    w.x -= x[4]
+    w.y += w.x * x[3]
+    out[0] = wp.length_sq(w)
+
+
+@wp.kernel
+def quat_component_kernel(x: wp.array[float], out: wp.array[float]):
+    q = wp.quat(x[0], x[1], x[2], x[3])
+    q.y += x[4]
+    q.w -= x[5]
+    q.y += x[4]
+    q.w -= x[5]
+    out[0] = wp.dot(q, wp.quat(1.0, 2.0, 3.0, 4.0))
+
+
+@wp.kernel
+def transform_translation_kernel(x: wp.array[float], out: wp.array[float]):
+    t = wp.transform(wp.vec3(x[0], x[1], x[2]), wp.quat(x[3], x[4], x[5], x[6]))
+    t.p += wp.vec3(x[7], x[8], x[9])
+    t.p -= wp.vec3(x[9], x[7], x[8])
+    t.p += wp.vec3(x[7], x[8], x[9])
+    out[0] = wp.dot(t.p, t.p) + t.q.y
+
+
+@wp.kernel
+def transform_rotation_kernel(x: wp.array[float], out: wp.array[float]):
+    t = wp.transform(wp.vec3(x[0], x[1], x[2]), wp.quat(x[3], x[4], x[5], x[6]))
+    t.q += wp.quat(x[7], x[8], x[9], x[10])
+    t.q -= wp.quat(x[10], x[7], x[8], x[9])
+    t.q += wp.quat(x[7], x[8], x[9], x[10])
+    out[0] = wp.dot(t.q, t.q) + t.p.y
+
+
+@wp.func
+def component_iadd_value_param(v: wp.vec3, b: float) -> float:
+    v.y += b
+    v.y += b
+    return v.y
+
+
+@wp.kernel
+def func_value_param_component_kernel(x: wp.array[float], out: wp.array[float]):
+    out[0] = component_iadd_value_param(wp.vec3(x[0], x[1], x[2]), x[3])
+
+
+def test_component_augassign_finite_differences(test, device):
+    """Repeated ``+=`` and ``-=`` on local components agree with central differences."""
+
+    def evaluate(kernel, values):
+        x = wp.array(values, dtype=float, device=device)
+        out = wp.zeros(1, dtype=float, device=device)
+        wp.launch(kernel, dim=1, inputs=[x, out], device=device)
+        return out.numpy()[0]
+
+    eps = 1e-2
+    x_values = np.array([1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 0.9, 0.4, 0.6, 0.8, 0.5], dtype=np.float32)
+
+    for kernel in (
+        vec_component_mixed_kernel,
+        quat_component_kernel,
+        transform_translation_kernel,
+        transform_rotation_kernel,
+        func_value_param_component_kernel,
+    ):
+        x = wp.array(x_values, dtype=float, requires_grad=True, device=device)
+        out = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+        tape = wp.Tape()
+        with tape:
+            wp.launch(kernel, dim=1, inputs=[x, out], device=device)
+        tape.backward(grads={out: wp.ones(1, dtype=float, device=device)})
+
+        expected = np.zeros_like(x_values)
+        for i in range(len(x_values)):
+            step = np.zeros_like(x_values)
+            step[i] = eps
+            expected[i] = (evaluate(kernel, x_values + step) - evaluate(kernel, x_values - step)) / (2.0 * eps)
+
+        np.testing.assert_allclose(x.grad.numpy(), expected, atol=1e-2, err_msg=kernel.key)
+
+
+@wp.kernel
+def transform_component_array_rhs_kernel(u: wp.array[wp.vec3], d: wp.array[wp.quat], out: wp.array[float]):
+    t = wp.transform_identity()
+    t.p += u[0]
+    t.p += u[0]
+    t.q += d[0]
+    t.q -= d[0]
+    t.q += d[0]
+    out[0] = t.p.y + 2.0 * t.q.z
+
+
+def test_transform_component_array_rhs(test, device):
+    """Transform component updates accumulate into a right-hand side read from an array."""
+    u = wp.array([[1.0, 2.0, 3.0]], dtype=wp.vec3, requires_grad=True, device=device)
+    d = wp.array([[0.1, 0.2, 0.3, 0.4]], dtype=wp.quat, requires_grad=True, device=device)
+    out = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch(transform_component_array_rhs_kernel, dim=1, inputs=[u, d, out], device=device)
+    tape.backward(grads={out: wp.ones(1, dtype=float, device=device)})
+
+    assert_np_equal(u.grad.numpy(), np.array([[0.0, 2.0, 0.0]]))
+    assert_np_equal(d.grad.numpy(), np.array([[0.0, 0.0, 2.0, 0.0]]))
+
+
+@wp.func
+def mutate_component_and_return_one(v: wp.ref[wp.vec3]) -> float:
+    v.y = v.y + 10.0
+    return 1.0
+
+
+@wp.kernel(enable_backward=False)
+def component_iadd_rhs_mutates_target_kernel(out: wp.array[float]):
+    w = wp.vec3(1.0, 2.0, 3.0)
+    w.y += mutate_component_and_return_one(w)
+    out[0] = w.y
+
+
+def test_component_iadd_rhs_mutates_target(test, device):
+    """``v.y += f(v)`` adds to the value loaded before ``f`` writes through its reference."""
+    out = wp.zeros(1, dtype=float, device=device)
+    wp.launch(component_iadd_rhs_mutates_target_kernel, dim=1, inputs=[out], device=device)
+    assert_np_equal(out.numpy(), np.array([3.0]))
+
+
 devices = get_test_devices()
 
 
@@ -435,6 +602,19 @@ add_function_test(TestLValue, "test_array_struct_struct_assign", test_array_stru
 add_function_test(TestLValue, "test_complex", test_complex, devices=devices)
 add_function_test(TestLValue, "test_swizzle", test_swizzle, devices=devices)
 add_function_test(TestLValue, "test_slice", test_slice, devices=devices)
+add_function_test(
+    TestLValue, "test_vec_component_iadd_matches_subscript", test_vec_component_iadd_matches_subscript, devices=devices
+)
+add_function_test(
+    TestLValue,
+    "test_component_augassign_finite_differences",
+    test_component_augassign_finite_differences,
+    devices=devices,
+)
+add_function_test(TestLValue, "test_transform_component_array_rhs", test_transform_component_array_rhs, devices=devices)
+add_function_test(
+    TestLValue, "test_component_iadd_rhs_mutates_target", test_component_iadd_rhs_mutates_target, devices=devices
+)
 
 
 if __name__ == "__main__":
